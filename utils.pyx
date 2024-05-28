@@ -2,8 +2,34 @@ import numpy as np
 import math
 cimport numpy as np
 from libc.math cimport ceil
+from cpython.bytes cimport PyBytes_FromStringAndSize
+from cpython cimport PyObject
 
 np.import_array()
+
+
+cdef extern from "wrapper.h":
+    ctypedef struct pdf_size:
+        int width
+        int height
+    cdef char* get_pdf_page(int pagenumber, char* filepath)
+    pdf_size get_pdf_page_size(int pagenumber, char* filepath)
+
+
+def get_page_size(pagenumber, filepath):
+    size = get_pdf_page_size(pagenumber, filepath)
+    return size.width, size.height
+
+
+cpdef get_pdf_page_bytes(int pagenumber, char* filepath):
+    size = get_pdf_page_size(pagenumber, filepath)
+    cdef char* bytes = get_pdf_page(pagenumber, filepath)
+    return PyBytes_FromStringAndSize(bytes, 4*size.width*size.height)
+
+
+def get_page(pagenumber, filepath):
+    return get_pdf_page_bytes(pagenumber, filepath)
+
 
 def _peak_prominences(const np.float64_t[::1] x not None,
                       np.intp_t[::1] peaks not None,
