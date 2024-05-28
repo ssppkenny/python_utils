@@ -17,7 +17,8 @@ cdef extern from "wrapper.h":
 
 
 def get_page_size(pagenumber, filepath):
-    size = get_pdf_page_size(pagenumber, filepath)
+    bpath = bytes(filepath, 'utf-8')
+    size = get_pdf_page_size(pagenumber, bpath)
     return size.width, size.height
 
 
@@ -28,7 +29,8 @@ cpdef get_pdf_page_bytes(int pagenumber, char* filepath):
 
 
 def get_page(pagenumber, filepath):
-    return get_pdf_page_bytes(pagenumber, filepath)
+    bpath = bytes(filepath, 'utf-8')
+    return get_pdf_page_bytes(pagenumber, bpath)
 
 
 def _peak_prominences(const np.float64_t[::1] x not None,
