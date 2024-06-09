@@ -21,3 +21,4 @@ pixi-pycharm = ">=0.0.5,<0.1"
 [pypi-dependencies]
 opencv-python = "~=4.9.0.80"
 kivy-ios = "~=2023.8.24"
+kivy = "~=2.3.0"
