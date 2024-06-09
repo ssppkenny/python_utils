@@ -1,0 +1,22 @@
+[project]
+name = "utils"
+version = "0.1.0"
+description = "Add a short description here"
+authors = ["Sergey Mikhno <sergey.mikhno@galenica.com>"]
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[tasks]
+
+[dependencies]
+cython = ">=3.0.10,<3.1"
+python = "3.11.*"
+numpy = ">=1.24.4,<1.25"
+pillow = ">=10.3.0,<10.4"
+matplotlib = ">=3.8.4,<3.9"
+jupyterlab = ">=4.2.1,<4.3"
+intervaltree = ">=3.1.0,<3.2"
+pixi-pycharm = ">=0.0.5,<0.1"
+
+[pypi-dependencies]
+opencv-python = "~=4.9.0.80"
