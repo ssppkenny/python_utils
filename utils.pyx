@@ -7,6 +7,96 @@ from cpython cimport PyObject
 
 np.import_array()
 
+cdef extern from *:
+   ctypedef int Py_intptr_t
+
+cdef enum:
+    BACKGROUND = 0
+    FOREGROUND = 1
+
+cdef extern from "numpy/arrayobject.h" nogil:
+    ctypedef struct PyArrayIterObject:
+        np.npy_intp *coordinates
+
+    void PyArray_ITER_NEXT(PyArrayIterObject *it)
+    int PyArray_ITER_NOTDONE(PyArrayIterObject *it)
+    void PyArray_ITER_RESET(PyArrayIterObject *it)
+    void *PyArray_ITER_DATA(PyArrayIterObject *it)
+
+    void *PyDataMem_NEW(size_t)
+    void PyDataMem_FREE(void *)
+    void *PyDataMem_RENEW(void *, size_t)
+
+class NeedMoreBits(Exception):
+    pass
+
+ctypedef fused data_t:
+    np.int8_t
+    np.int16_t
+    np.int32_t
+    np.int64_t
+    np.uint8_t
+    np.uint16_t
+    np.uint32_t
+    np.uint64_t
+    np.float32_t
+    np.float64_t
+
+######################################################################
+# Load a line from a fused data array, setting the line to FOREGROUND wherever
+# the fused data is nonzero, BACKGROUND elsewhere
+######################################################################
+cdef void fused_nonzero_line(data_t *p, np.intp_t stride,
+                             np.uintp_t *line, np.intp_t L) noexcept nogil:
+    cdef np.intp_t i
+    for i in range(L):
+        line[i] = FOREGROUND if \
+            (<data_t *> ((<char *> p) + i * stride))[0] \
+            else BACKGROUND
+
+
+######################################################################
+# Load a line from a fused data array to a np.uintp_t array
+######################################################################
+cdef void fused_read_line(data_t *p, np.intp_t stride,
+                          np.uintp_t *line, np.intp_t L) noexcept nogil:
+    cdef np.intp_t i
+    for i in range(L):
+        line[i] = <np.uintp_t> (<data_t *> ((<char *> p) + i * stride))[0]
+
+
+######################################################################
+# Store a line from a np.uintp_t array to a fused data array if possible,
+# returning True if overflowed
+######################################################################
+cdef bint fused_write_line(data_t *p, np.intp_t stride,
+                           np.uintp_t *line, np.intp_t L) noexcept nogil:
+    cdef np.intp_t i
+    for i in range(L):
+        # Check before overwrite, as this prevents us accidentally writing a 0
+        # in the foreground, which allows us to retry even when operating
+        # in-place.
+        if line[i] != <np.uintp_t> <data_t> line[i]:
+            return True
+        (<data_t *> ((<char *> p) + i * stride))[0] = <data_t> line[i]
+    return False
+
+
+ctypedef void (*nonzero_line_func_t)(void *p, np.intp_t stride,
+                                     np.uintp_t *line, np.intp_t L) noexcept nogil
+ctypedef void (*read_line_func_t)(void *p, np.intp_t stride,
+                                  np.uintp_t *line, np.intp_t L) noexcept nogil
+ctypedef bint (*write_line_func_t)(void *p, np.intp_t stride,
+                                   np.uintp_t *line, np.intp_t L) noexcept nogil
+
+def get_nonzero_line(np.ndarray[data_t] a):
+    return <Py_intptr_t> fused_nonzero_line[data_t]
+
+def get_read_line(np.ndarray[data_t] a):
+    return <Py_intptr_t> fused_read_line[data_t]
+
+def get_write_line(np.ndarray[data_t] a):
+    return <Py_intptr_t> fused_write_line[data_t]
 
 cdef extern from "wrapper.h":
     ctypedef struct pdf_size:
@@ -31,6 +121,621 @@ cpdef get_pdf_page_bytes(int pagenumber, char* filepath):
 def get_page(pagenumber, filepath):
     bpath = bytes(filepath, 'utf-8')
     return get_pdf_page_bytes(pagenumber, bpath)
+
+
+######################################################################
+# Mark two labels to be merged
+######################################################################
+cdef inline np.uintp_t mark_for_merge(np.uintp_t a,
+                                      np.uintp_t b,
+                                      np.uintp_t *mergetable) noexcept nogil:
+
+    cdef:
+        np.uintp_t orig_a, orig_b, minlabel
+
+    orig_a = a
+    orig_b = b
+    # find smallest root for each of a and b
+    while a != mergetable[a]:
+        a = mergetable[a]
+    while b != mergetable[b]:
+        b = mergetable[b]
+    minlabel = a if (a < b) else b
+
+    # merge roots
+    mergetable[a] = mergetable[b] = minlabel
+
+    # merge every step to minlabel
+    a = orig_a
+    b = orig_b
+    while a != minlabel:
+        a, mergetable[a] = mergetable[a], minlabel
+    while b != minlabel:
+        b, mergetable[b] = mergetable[b], minlabel
+
+    return minlabel
+
+
+######################################################################
+# Take the label of a neighbor, or mark them for merging
+######################################################################
+cdef inline np.uintp_t take_label_or_merge(np.uintp_t cur_label,
+                                           np.uintp_t neighbor_label,
+                                           np.uintp_t *mergetable) noexcept nogil:
+    if neighbor_label == BACKGROUND:
+        return cur_label
+    if cur_label == FOREGROUND:
+        return neighbor_label  # neighbor is not BACKGROUND
+    if neighbor_label:
+        if cur_label != neighbor_label:
+            cur_label = mark_for_merge(neighbor_label, cur_label, mergetable)
+    return cur_label
+
+
+######################################################################
+# Label one line of input, using a neighbor line that has already been labeled.
+######################################################################
+cdef np.uintp_t label_line_with_neighbor(np.uintp_t *line,
+                                         np.uintp_t *neighbor,
+                                         int neighbor_use_previous,
+                                         int neighbor_use_adjacent,
+                                         int neighbor_use_next,
+                                         np.intp_t L,
+                                         bint label_unlabeled,
+                                         bint use_previous,
+                                         np.uintp_t next_region,
+                                         np.uintp_t *mergetable) noexcept nogil:
+    cdef:
+        np.intp_t i
+
+    for i in range(L):
+        if line[i] != BACKGROUND:
+            # See allocation of line_buffer for why this is valid when i = 0
+            if neighbor_use_previous:
+                line[i] = take_label_or_merge(line[i], neighbor[i - 1], mergetable)
+            if neighbor_use_adjacent:
+                line[i] = take_label_or_merge(line[i], neighbor[i], mergetable)
+            if neighbor_use_next:
+                line[i] = take_label_or_merge(line[i], neighbor[i + 1], mergetable)
+            if label_unlabeled:
+                if use_previous:
+                    line[i] = take_label_or_merge(line[i], line[i - 1], mergetable)
+                if line[i] == FOREGROUND:  # still needs a label
+                    line[i] = next_region
+                    mergetable[next_region] = next_region
+                    next_region += 1
+    return next_region
+
+
+cpdef _label(np.ndarray input,
+             np.ndarray structure,
+             np.ndarray output):
+    # check dimensions
+    # To understand the need for the casts to object in order to use
+    # tuple.__eq__, see https://github.com/cython/cython/issues/863
+    assert (<object> input).shape == (<object> output).shape, \
+        ("Shapes must match for input and output,"
+         "{} != {}".format((<object> input).shape, (<object> output).shape))
+
+    structure = np.asanyarray(structure, dtype=np.bool_).copy()
+    assert input.ndim == structure.ndim, \
+        ("Structuring element must have same "
+         "# of dimensions as input, "
+         "{:d} != {:d}".format(input.ndim, structure.ndim))
+
+    # Check that structuring element is of size 3 in every dimension
+    assert set((<object> structure).shape) <= set([3]), \
+        ("Structuring element must be size 3 in every dimension, "
+         "was {}".format((<object> structure).shape))
+
+    # check structuring element for symmetry
+    assert np.all(structure == structure[(np.s_[::-1],) * structure.ndim]), \
+        "Structuring element is not symmetric"
+
+    # make sure we're dealing with a non-empty, non-scalar array
+    assert input.ndim > 0 and input.size > 0, "Cannot label scalars or empty arrays"
+
+    # if we're handed booleans, we treat them as uint8s
+    if input.dtype == np.bool_:
+        input = input.view(dtype=np.uint8)
+    if output.dtype == np.bool_:
+        # XXX - trigger special check for bit depth?
+        output = output.view(dtype=np.uint8)
+
+    cdef:
+        nonzero_line_func_t nonzero_line = \
+            <nonzero_line_func_t> <void *> <Py_intptr_t> get_nonzero_line(input.take([0]))
+        read_line_func_t read_line = \
+            <read_line_func_t> <void *> <Py_intptr_t> get_read_line(output.take([0]))
+        write_line_func_t write_line = \
+            <write_line_func_t> <void *> <Py_intptr_t> get_write_line(output.take([0]))
+        np.flatiter _iti, _ito, _itstruct
+        PyArrayIterObject *iti
+        PyArrayIterObject *ito
+        PyArrayIterObject *itstruct
+        int axis, idim, num_neighbors, ni
+        np.intp_t L, delta, i
+        np.intp_t si, so, ss
+        np.intp_t total_offset
+        np.intp_t output_ndim, structure_ndim
+        bint needs_self_labeling, valid, use_previous, overflowed
+        np.ndarray _line_buffer, _neighbor_buffer
+        np.uintp_t *line_buffer
+        np.uintp_t *neighbor_buffer
+        np.uintp_t *tmp
+        np.uintp_t next_region, src_label, dest_label
+        np.uintp_t mergetable_size
+        np.uintp_t *mergetable
+
+    axis = -1  # choose best axis based on output
+    _ito = np.PyArray_IterAllButAxis(output, &axis)
+    _iti = np.PyArray_IterAllButAxis(input, &axis)
+    _itstruct = np.PyArray_IterAllButAxis(structure, &axis)
+
+    ito = <PyArrayIterObject *> _ito
+    iti = <PyArrayIterObject *> _iti
+    itstruct = <PyArrayIterObject *> _itstruct
+
+    # we only process this many neighbors from the itstruct iterator before
+    # reaching the center, where we stop
+    num_neighbors = structure.size // (3 * 2)
+
+    # Create two buffer arrays for reading/writing labels.
+    # Add an entry at the end and beginning to simplify some bounds checks.
+    L = input.shape[axis]
+    _line_buffer = np.empty(L + 2, dtype=np.uintp)
+    _neighbor_buffer = np.empty(L + 2, dtype=np.uintp)
+    line_buffer = <np.uintp_t *> _line_buffer.data
+    neighbor_buffer = <np.uintp_t *> _neighbor_buffer.data
+
+    # Add fenceposts with background values
+    line_buffer[0] = neighbor_buffer[0] = BACKGROUND
+    line_buffer[L + 1] = neighbor_buffer[L + 1] = BACKGROUND
+    line_buffer = line_buffer + 1
+    neighbor_buffer = neighbor_buffer + 1
+
+    mergetable_size = 2 * output.shape[axis]
+    mergetable = <np.uintp_t *> PyDataMem_NEW(mergetable_size * sizeof(np.uintp_t))
+    if mergetable == NULL:
+        raise MemoryError()
+
+    try:
+        # strides
+        si = input.strides[axis]
+        so = output.strides[axis]
+        ss = structure.strides[axis]
+
+        # 0 = background
+        # 1 = foreground, needs label
+        # 2... = working labels, will be compacted on output
+        next_region = 2
+
+        structure_ndim = structure.ndim
+        temp = [1] * structure_ndim
+        temp[axis] = 0
+        use_previous = (structure[tuple(temp)] != 0)
+        output_ndim = output.ndim
+        output_shape = output.shape
+        output_strides = output.strides
+
+        with nogil:
+            while PyArray_ITER_NOTDONE(iti):
+                # Optimization - for 2D, line_buffer becomes next iteration's
+                # neighbor buffer
+                if output_ndim == 2:
+                    tmp = line_buffer
+                    line_buffer = neighbor_buffer
+                    neighbor_buffer = tmp
+
+                # copy nonzero values in input to line_buffer as FOREGROUND
+                nonzero_line(PyArray_ITER_DATA(iti), si, line_buffer, L)
+
+                # Used for labeling single lines
+                needs_self_labeling = True
+
+                # Take neighbor labels
+                PyArray_ITER_RESET(itstruct)
+                for ni in range(num_neighbors):
+                    neighbor_use_prev = (<np.npy_bool *> PyArray_ITER_DATA(itstruct))[0]
+                    neighbor_use_adjacent = (<np.npy_bool *> (<char *> PyArray_ITER_DATA(itstruct) + ss))[0]
+                    neighbor_use_next = (<np.npy_bool *> (<char *> PyArray_ITER_DATA(itstruct) + 2 * ss))[0]
+                    if not (neighbor_use_prev or
+                            neighbor_use_adjacent or
+                            neighbor_use_next):
+                        PyArray_ITER_NEXT(itstruct)
+                        continue
+
+                    # Check that the neighbor line is in bounds
+                    valid = True
+                    total_offset = 0
+                    for idim in range(structure_ndim):
+                        if idim == axis:
+                            continue
+                        delta = (itstruct.coordinates[idim] - 1)  # 1,1,1... is center
+                        if not (0 <= (ito.coordinates[idim] + delta) < output_shape[idim]):
+                            valid = False
+                            break
+                        total_offset += delta * output_strides[idim]
+
+                    if valid:
+                        # Optimization (see above) - for 2D, line_buffer
+                        # becomes next iteration's neighbor buffer, so no
+                        # need to read it here.
+                        if output_ndim != 2:
+                            read_line(<char *> PyArray_ITER_DATA(ito) + total_offset, so,
+                                      neighbor_buffer, L)
+
+                        # be conservative about how much space we may need
+                        while mergetable_size < (next_region + L):
+                            mergetable_size *= 2
+                            mergetable = <np.uintp_t *> \
+                                PyDataMem_RENEW(<void *> mergetable,
+                                                 mergetable_size * sizeof(np.uintp_t))
+
+                        next_region = label_line_with_neighbor(line_buffer,
+                                                              neighbor_buffer,
+                                                              neighbor_use_prev,
+                                                              neighbor_use_adjacent,
+                                                              neighbor_use_next,
+                                                              L,
+                                                              ni == (num_neighbors - 1),
+                                                              use_previous,
+                                                              next_region,
+                                                              mergetable)
+                        if ni == (num_neighbors - 1):
+                            needs_self_labeling = False
+                    PyArray_ITER_NEXT(itstruct)
+
+                if needs_self_labeling:
+                    # We didn't call label_line_with_neighbor above with
+                    # label_unlabeled=True, so call it now in such a way as to
+                    # cause unlabeled regions to get a label.
+                    while mergetable_size < (next_region + L):
+                            mergetable_size *= 2
+                            mergetable = <np.uintp_t *> \
+                                PyDataMem_RENEW(<void *> mergetable,
+                                                 mergetable_size * sizeof(np.uintp_t))
+
+                    next_region = label_line_with_neighbor(line_buffer,
+                                                          neighbor_buffer,
+                                                          False, False, False,  # no neighbors
+                                                          L,
+                                                          True,
+                                                          use_previous,
+                                                          next_region,
+                                                          mergetable)
+
+                overflowed = write_line(PyArray_ITER_DATA(ito), so,
+                                        line_buffer, L)
+                if overflowed:
+                    with gil:
+                        raise NeedMoreBits()
+
+                PyArray_ITER_NEXT(iti)
+                PyArray_ITER_NEXT(ito)
+
+            # compact the mergetable, mapping each value to its destination
+            mergetable[BACKGROUND] = BACKGROUND
+            mergetable[FOREGROUND] = -1  # should never be encountered
+            mergetable[2] = 1  # labels started here
+            dest_label = 2
+            # next_region is still the original value -> we found no regions
+            # set dest_label to 1 so we return 0
+            if next_region < 3:
+                dest_label = 1
+            for src_label in range(3, next_region):
+                # labels that map to themselves are new regions
+                if mergetable[src_label] == src_label:
+                    mergetable[src_label] = dest_label
+                    dest_label += 1
+                else:
+                    # we've compacted every label below this, and the
+                    # mergetable has an invariant (from mark_for_merge()) that
+                    # it always points downward.  Therefore, we can fetch the
+                    # final label by two steps of indirection.
+                    mergetable[src_label] = mergetable[mergetable[src_label]]
+
+            PyArray_ITER_RESET(ito)
+            while PyArray_ITER_NOTDONE(ito):
+                read_line(PyArray_ITER_DATA(ito), so, line_buffer, L)
+                for i in range(L):
+                    line_buffer[i] = mergetable[line_buffer[i]]
+                write_line(PyArray_ITER_DATA(ito), so, line_buffer, L)
+                PyArray_ITER_NEXT(ito)
+    except:  # noqa: E722
+        # clean up and re-raise
+        PyDataMem_FREE(<void *> mergetable)
+        raise
+
+    PyDataMem_FREE(<void *> mergetable)
+    return dest_label - 1
+
+
+def generate_binary_structure(rank, connectivity):
+    """
+    Generate a binary structure for binary morphological operations.
+
+    Parameters
+    ----------
+    rank : int
+         Number of dimensions of the array to which the structuring element
+         will be applied, as returned by `np.ndim`.
+    connectivity : int
+         `connectivity` determines which elements of the output array belong
+         to the structure, i.e., are considered as neighbors of the central
+         element. Elements up to a squared distance of `connectivity` from
+         the center are considered neighbors. `connectivity` may range from 1
+         (no diagonal elements are neighbors) to `rank` (all elements are
+         neighbors).
+
+    Returns
+    -------
+    output : ndarray of bools
+         Structuring element which may be used for binary morphological
+         operations, with `rank` dimensions and all dimensions equal to 3.
+
+    See Also
+    --------
+    iterate_structure, binary_dilation, binary_erosion
+
+    Notes
+    -----
+    `generate_binary_structure` can only create structuring elements with
+    dimensions equal to 3, i.e., minimal dimensions. For larger structuring
+    elements, that are useful e.g., for eroding large objects, one may either
+    use `iterate_structure`, or create directly custom arrays with
+    numpy functions such as `numpy.ones`.
+
+    Examples
+    --------
+    >>> from scipy import ndimage
+    >>> import numpy as np
+    >>> struct = ndimage.generate_binary_structure(2, 1)
+    >>> struct
+    array([[False,  True, False],
+           [ True,  True,  True],
+           [False,  True, False]], dtype=bool)
+    >>> a = np.zeros((5,5))
+    >>> a[2, 2] = 1
+    >>> a
+    array([[ 0.,  0.,  0.,  0.,  0.],
+           [ 0.,  0.,  0.,  0.,  0.],
+           [ 0.,  0.,  1.,  0.,  0.],
+           [ 0.,  0.,  0.,  0.,  0.],
+           [ 0.,  0.,  0.,  0.,  0.]])
+    >>> b = ndimage.binary_dilation(a, structure=struct).astype(a.dtype)
+    >>> b
+    array([[ 0.,  0.,  0.,  0.,  0.],
+           [ 0.,  0.,  1.,  0.,  0.],
+           [ 0.,  1.,  1.,  1.,  0.],
+           [ 0.,  0.,  1.,  0.,  0.],
+           [ 0.,  0.,  0.,  0.,  0.]])
+    >>> ndimage.binary_dilation(b, structure=struct).astype(a.dtype)
+    array([[ 0.,  0.,  1.,  0.,  0.],
+           [ 0.,  1.,  1.,  1.,  0.],
+           [ 1.,  1.,  1.,  1.,  1.],
+           [ 0.,  1.,  1.,  1.,  0.],
+           [ 0.,  0.,  1.,  0.,  0.]])
+    >>> struct = ndimage.generate_binary_structure(2, 2)
+    >>> struct
+    array([[ True,  True,  True],
+           [ True,  True,  True],
+           [ True,  True,  True]], dtype=bool)
+    >>> struct = ndimage.generate_binary_structure(3, 1)
+    >>> struct # no diagonal elements
+    array([[[False, False, False],
+            [False,  True, False],
+            [False, False, False]],
+           [[False,  True, False],
+            [ True,  True,  True],
+            [False,  True, False]],
+           [[False, False, False],
+            [False,  True, False],
+            [False, False, False]]], dtype=bool)
+
+    """
+    if connectivity < 1:
+        connectivity = 1
+    if rank < 1:
+        return np.array(True, dtype=bool)
+    output = np.fabs(np.indices([3] * rank) - 1)
+    output = np.add.reduce(output, 0)
+    return output <= connectivity
+
+
+def label(input, structure=None, output=None):
+    """
+    Label features in an array.
+
+    Parameters
+    ----------
+    input : array_like
+        An array-like object to be labeled. Any non-zero values in `input` are
+        counted as features and zero values are considered the background.
+    structure : array_like, optional
+        A structuring element that defines feature connections.
+        `structure` must be centrosymmetric
+        (see Notes).
+        If no structuring element is provided,
+        one is automatically generated with a squared connectivity equal to
+        one.  That is, for a 2-D `input` array, the default structuring element
+        is::
+
+            [[0,1,0],
+             [1,1,1],
+             [0,1,0]]
+
+    output : (None, data-type, array_like), optional
+        If `output` is a data type, it specifies the type of the resulting
+        labeled feature array.
+        If `output` is an array-like object, then `output` will be updated
+        with the labeled features from this function.  This function can
+        operate in-place, by passing output=input.
+        Note that the output must be able to store the largest label, or this
+        function will raise an Exception.
+
+    Returns
+    -------
+    label : ndarray or int
+        An integer ndarray where each unique feature in `input` has a unique
+        label in the returned array.
+    num_features : int
+        How many objects were found.
+
+        If `output` is None, this function returns a tuple of
+        (`labeled_array`, `num_features`).
+
+        If `output` is a ndarray, then it will be updated with values in
+        `labeled_array` and only `num_features` will be returned by this
+        function.
+
+    See Also
+    --------
+    find_objects : generate a list of slices for the labeled features (or
+                   objects); useful for finding features' position or
+                   dimensions
+
+    Notes
+    -----
+    A centrosymmetric matrix is a matrix that is symmetric about the center.
+    See [1]_ for more information.
+
+    The `structure` matrix must be centrosymmetric to ensure
+    two-way connections.
+    For instance, if the `structure` matrix is not centrosymmetric
+    and is defined as::
+
+        [[0,1,0],
+         [1,1,0],
+         [0,0,0]]
+
+    and the `input` is::
+
+        [[1,2],
+         [0,3]]
+
+    then the structure matrix would indicate the
+    entry 2 in the input is connected to 1,
+    but 1 is not connected to 2.
+
+    References
+    ----------
+    .. [1] James R. Weaver, "Centrosymmetric (cross-symmetric)
+       matrices, their basic properties, eigenvalues, and
+       eigenvectors." The American Mathematical Monthly 92.10
+       (1985): 711-717.
+
+    Examples
+    --------
+    Create an image with some features, then label it using the default
+    (cross-shaped) structuring element:
+
+    >>> from scipy.ndimage import label, generate_binary_structure
+    >>> import numpy as np
+    >>> a = np.array([[0,0,1,1,0,0],
+    ...               [0,0,0,1,0,0],
+    ...               [1,1,0,0,1,0],
+    ...               [0,0,0,1,0,0]])
+    >>> labeled_array, num_features = label(a)
+
+    Each of the 4 features are labeled with a different integer:
+
+    >>> num_features
+    4
+    >>> labeled_array
+    array([[0, 0, 1, 1, 0, 0],
+           [0, 0, 0, 1, 0, 0],
+           [2, 2, 0, 0, 3, 0],
+           [0, 0, 0, 4, 0, 0]])
+
+    Generate a structuring element that will consider features connected even
+    if they touch diagonally:
+
+    >>> s = generate_binary_structure(2,2)
+
+    or,
+
+    >>> s = [[1,1,1],
+    ...      [1,1,1],
+    ...      [1,1,1]]
+
+    Label the image using the new structuring element:
+
+    >>> labeled_array, num_features = label(a, structure=s)
+
+    Show the 2 labeled features (note that features 1, 3, and 4 from above are
+    now considered a single feature):
+
+    >>> num_features
+    2
+    >>> labeled_array
+    array([[0, 0, 1, 1, 0, 0],
+           [0, 0, 0, 1, 0, 0],
+           [2, 2, 0, 0, 1, 0],
+           [0, 0, 0, 1, 0, 0]])
+
+    """
+    input = np.asarray(input)
+    if np.iscomplexobj(input):
+        raise TypeError('Complex type not supported')
+    if structure is None:
+        structure = generate_binary_structure(input.ndim, 1)
+    structure = np.asarray(structure, dtype=bool)
+    if structure.ndim != input.ndim:
+        raise RuntimeError('structure and input must have equal rank')
+    for ii in structure.shape:
+        if ii != 3:
+            raise ValueError('structure dimensions must be equal to 3')
+
+    # Use 32 bits if it's large enough for this image.
+    # _ni_label.label() needs two entries for background and
+    # foreground tracking
+    need_64bits = input.size >= (2**31 - 2)
+
+    if isinstance(output, np.ndarray):
+        if output.shape != input.shape:
+            raise ValueError("output shape not correct")
+        caller_provided_output = True
+    else:
+        caller_provided_output = False
+        if output is None:
+            output = np.empty(input.shape, np.intp if need_64bits else np.int32)
+        else:
+            output = np.empty(input.shape, output)
+
+    # handle scalars, 0-D arrays
+    if input.ndim == 0 or input.size == 0:
+        if input.ndim == 0:
+            # scalar
+            maxlabel = 1 if (input != 0) else 0
+            output[...] = maxlabel
+        else:
+            # 0-D
+            maxlabel = 0
+        if caller_provided_output:
+            return maxlabel
+        else:
+            return output, maxlabel
+
+    try:
+        max_label = _label(input, structure, output)
+    except NeedMoreBits as e:
+        # Make another attempt with enough bits, then try to cast to the
+        # new type.
+        tmp_output = np.empty(input.shape, np.intp if need_64bits else np.int32)
+        max_label = _label(input, structure, tmp_output)
+        output[...] = tmp_output[...]
+        if not np.all(output == tmp_output):
+            # refuse to return bad results
+            raise RuntimeError(
+                "insufficient bit-depth in requested output type"
+            ) from e
+
+    if caller_provided_output:
+        # result was written in-place
+        return max_label
+    else:
+        return output, max_label
 
 
 def _peak_prominences(const np.float64_t[::1] x not None,
