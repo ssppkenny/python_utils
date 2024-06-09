@@ -4,12 +4,12 @@ version = "0.1.0"
 description = "Add a short description here"
 authors = ["Sergey Mikhno <sergey.mikhno@galenica.com>"]
 channels = ["conda-forge"]
-platforms = ["osx-arm64"]
+platforms = ["osx-64", "osx-arm64"]
 
 [tasks]
 
 [dependencies]
-cython = ">=3.0.10,<3.1"
+cython = "=0.29.36"
 python = "3.11.*"
 numpy = ">=1.24.4,<1.25"
 pillow = ">=10.3.0,<10.4"
@@ -20,3 +20,4 @@ pixi-pycharm = ">=0.0.5,<0.1"
 
 [pypi-dependencies]
 opencv-python = "~=4.9.0.80"
+kivy-ios = "~=2023.8.24"
