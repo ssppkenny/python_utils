@@ -1,0 +1,38 @@
+#:kivy 1.1.0
+
+Root:
+    BoxLayout:
+        orientation: 'vertical'
+
+        BoxLayout:
+            Image:
+                id: image
+                src: ''
+                on_touch_down: root.touch_down(args[1])
+        BoxLayout:
+            size_hint_y: None
+            height: 200
+            Button:
+                text: 'Load'
+                on_release: root.show_load()
+
+<LoadDialog>:
+    BoxLayout:
+        size: root.size
+        pos: root.pos
+        orientation: "vertical"
+        FileChooserListView:
+            id: filechooser
+            path: app.user_data_dir
+
+        BoxLayout:
+            size_hint_y: None
+            height: 90
+            Button:
+                text: "Cancel"
+                on_release: root.cancel()
+
+            Button:
+                text: "Load"
+                on_release: root.load(filechooser.path, filechooser.selection)
+

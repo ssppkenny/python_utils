@@ -1,3 +1,12 @@
+from kivy.app import App
+from kivy.uix.floatlayout import FloatLayout
+from kivy.factory import Factory
+from kivy.properties import ObjectProperty
+from kivy.uix.popup import Popup
+from kivy.logger import Logger
+from kivy.uix.button import Button
+from kivy.properties import ListProperty
+
 import kivy
 import os
 import utils
@@ -9,13 +18,11 @@ from collections import defaultdict, Counter
 import intervaltree
 
 from kivy.core.window import Window
-from kivy.app import App
+from kivy.uix.gridlayout import GridLayout
 import kivy.uix.image
 from PIL import Image, ImageOps, ImageDraw
 from kivy.clock import Clock
 from kivy.core.image import Image as CoreImage
-
-kivy.require("2.3.0")
 
 
 @dataclass
@@ -278,15 +285,42 @@ def reflow(img, indent_width, flow_items, w, indents, mean_h):
             y += int(3 * mean_h)
     return newimage
 
+class LoadDialog(FloatLayout):
+    load = ObjectProperty(None)
+    cancel = ObjectProperty(None)
 
-class MyImage(kivy.uix.image.Image):
+
+class Root(FloatLayout):
+    loadfile = ObjectProperty(None)
+    text_input = ObjectProperty(None)
+    image = ObjectProperty(None)
+    pageno = 0
     scheduled_event = None
+    filename = None
+    reflowed = False
 
-    def __init__(self, filename, **kwargs):
-        self.pageno = 0
-        self.filename = filename
-        self.reflowed = False
-        super().__init__(**kwargs)
+
+    def dismiss_popup(self):
+        self._popup.dismiss()
+
+    def show_load(self):
+        content = LoadDialog(load=self.load, cancel=self.dismiss_popup)
+        self._popup = Popup(title="Load file", content=content,
+                            size_hint=(0.9, 0.9))
+        self._popup.open()
+
+    def load(self, path, filename):
+        self.filename = filename[0]
+        b = utils.get_page(self.pageno, filename[0])
+        w, h = utils.get_page_size(self.pageno, filename[0])
+        img = Image.frombytes("RGBA", (w, h), b)
+        data = BytesIO()
+        img.save(data, format='png')
+        data.seek(0)
+        im = CoreImage(BytesIO(data.read()), ext='png')
+        self.ids.image.texture = im.texture
+
+        self.dismiss_popup()
 
     def single_tap(self, t):
         w, _ = Window.size
@@ -298,14 +332,15 @@ class MyImage(kivy.uix.image.Image):
         self.update()
 
     def double_tap(self, touch):
-        print("double tap")
         self.reflowed = not self.reflowed
         try:
             self.update()
         except Exception as e:
             print(e)
 
-    def on_touch_down(self, touch):
+    def touch_down(self, touch):
+        if self.filename is None:
+            return
         self.touch = touch
         if self.scheduled_event is not None:
             self.scheduled_event.cancel()
@@ -329,24 +364,22 @@ class MyImage(kivy.uix.image.Image):
             new_image.save(data, format='png')
             data.seek(0)
             im = CoreImage(BytesIO(data.read()), ext='png')
-            self.texture = im.texture
+            self.ids.image.texture = im.texture
         else:
             data = BytesIO()
             img.save(data, format='png')
             data.seek(0)
             im = CoreImage(BytesIO(data.read()), ext='png')
-            self.texture = im.texture
+            self.ids.image.texture = im.texture
 
 
-class MyApp(App):
-    def build(self):
-        user_dir = App.get_running_app().user_data_dir
-        print(user_dir)
-        pdf_name = user_dir + "/" + "Ulysses.pdf"
-        pic_img = MyImage(pdf_name)
-        pic_img.update()
-        return pic_img
+class Editor(App):
+    pass
+
+Factory.register('Root', cls=Root)
+Factory.register('LoadDialog', cls=LoadDialog)
 
 
-if __name__ == "__main__":
-    MyApp().run()
+if __name__ == '__main__':
+    app = Editor()
+    app.run()
